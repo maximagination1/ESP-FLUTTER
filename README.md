@@ -29,9 +29,6 @@ flight and can be controlled wirelessly using a smartphone or RC transmitter.
 
 > The current configuration enables fixed-amplitude test mode, where throttle controls flapping frequency. Hover is a tuning profile; it does not provide automatic stabilization or position holding.
 
-As Max gets more time, the remaining documentation and setup guide for ESP-FLUTTER Firmware will be eventually added.
-For now, please refer to the video instructions and other files which already contain this information.
-
 ## Flashing Firmware
 
 Use the online [ESP Tool](https://espressif.github.io/esptool-js/) to flash the firmware directly from **Google Chrome** through a USB serial connection. No Python installation is required.
@@ -62,6 +59,9 @@ If the board does not connect, hold **BOOT**, press and release **RESET**, then 
 2. Enter the WiFi password: **12345678**.
 3. Open **http://192.168.4.1** in your browser.
 4. Check wing clearance, servo alignment, and control direction before flight.
+
+As Max gets more time, the remaining documentation for ESP-FLUTTER Firmware will be eventually added.
+For now, please refer to the video instructions and other files which already contain any info you may need to get set up.
 
 ## License & Usage
 
