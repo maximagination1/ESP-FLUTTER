@@ -1,0 +1,20 @@
+# ESP-FLUTTER Project Context
+
+This is an ESP32 flapping-wing / servo-controlled project built in PlatformIO.
+
+Important coding rules:
+- Do not rewrite unrelated files.
+- Keep existing function names unless absolutely necessary.
+- Explain every code change before applying it.
+- Preserve my current control structure unless I ask for a refactor.
+
+Current motion system:
+- updateWingMotion() handles wing motion using micros(), deltaTime, phase, flapFrequency, and flapAmplitude.
+- setAmplitude(float amplitude) controls flapAmplitude.
+- Low-speed motion previously had poor range of motion.
+- The goal is smooth servo flapping with enough movement at low and high speeds.
+
+Previous chat context:
+- We adjusted flap amplitude logic.
+- The user prefers step-by-step code edits, not full rewrites.
+- The assistant should ask before changing architecture.
