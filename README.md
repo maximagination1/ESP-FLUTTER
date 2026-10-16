@@ -4,8 +4,9 @@ Official firmware for **ESP-FLUTTER**, an ESP32-powered bionic RC butterfly.
 
 Inspired by the [Ctorque](https://www.youtube.com/@CTorque) design, ESP-FLUTTER uses a XIAO ESP32-C3 and two digital servos to generate controllable flapping-wing flight, supports LED wing control, comes in both modular and PCB variants for ease of assembly, and can be flown wirelessly using a smartphone or RC transmitter.
 
-🎥 **Full Build Tutorial:** [YouTube link]
-📁 **Project Files & BOM:** [Project link]
+🎥 **Full Build Tutorial:** [https://youtu.be/5Le4I-1Pf9I]
+
+📁 **Project Files & BOM:** [https://drive.google.com/drive/folders/1XTTW8Ez_hmZl5E6mPUDXgX2qnnI3Cp2e?usp=sharing ]
 
 ## Features
 
