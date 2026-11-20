@@ -7,6 +7,7 @@
 #include "wifi_control.h"
 #include "hover_bias.h"
 #include "hardware_config.h"
+#include "flight_mode.h"
 #include <Preferences.h>
 
 #if ENABLE_STEERING_DEBUG
@@ -61,6 +62,8 @@ static const char *KEY_STRIM = "strim";
 static float steeringTrim = 0.0f;
 static float centerAngle = 90.0f;
 static const char *KEY_PITCH = "pitch";
+static const char *KEY_ARMED_GLIDE_PITCH = "armedGlide";
+static float armedNeutralGlidePitch = 10.0f;
 static const char *KEY_STEER_DIFF_GAIN = "sdgain";
 static const char *KEY_TURN_COMP = "turncomp";
 static const char *KEY_SERVO_HZ = "servoHz";
@@ -83,6 +86,24 @@ static float leftNeutralAngle()
 static float rightNeutralAngle()
 {
     return getCurrentNeutralAngle();
+}
+
+static float armedIdlePitchOffset()
+{
+    return getFlightMode() == FLIGHT_MODE_ARMED &&
+        (flapFrequency <= 0.05f || flapAmplitude <= AMPLITUDE_IDLE_THRESHOLD || !amplitudeActive)
+        ? armedNeutralGlidePitch
+        : 0.0f;
+}
+
+static float leftIdleNeutralAngle()
+{
+    return 180.0f - (getCurrentNeutralAngle() + armedIdlePitchOffset());
+}
+
+static float rightIdleNeutralAngle()
+{
+    return getCurrentNeutralAngle() + armedIdlePitchOffset();
 }
 
 static float clampServoAngle(float angle)
@@ -169,8 +190,8 @@ void setServoPitchAngle(float deg)
     prefsTrim.end();
     // The servos are mirrored, so their numeric neutral angles must move in
     // opposite directions for both wings to move together physically.
-    float newL = leftNeutralAngle() + leftTrim + rollBiasDegrees;
-    float newR = rightNeutralAngle() + rightTrim + rollBiasDegrees;
+    float newL = leftIdleNeutralAngle() + leftTrim + rollBiasDegrees;
+    float newR = rightIdleNeutralAngle() + rightTrim + rollBiasDegrees;
     newL = constrain(newL, SERVO_SAFE_MIN_ANGLE, SERVO_SAFE_MAX_ANGLE);
     newR = constrain(newR, SERVO_SAFE_MIN_ANGLE, SERVO_SAFE_MAX_ANGLE);
     float prevL = leftServo.read();
@@ -194,6 +215,19 @@ float getServoPitchAngle()
 float getCurrentNeutralAngle()
 {
     return getHoverBiasNeutralAngle(centerAngle);
+}
+
+void setArmedNeutralGlidePitch(float degrees)
+{
+    armedNeutralGlidePitch = constrain(degrees, 0.0f, 20.0f);
+    prefsTrim.begin(TRIM_NS, false);
+    prefsTrim.putFloat(KEY_ARMED_GLIDE_PITCH, armedNeutralGlidePitch);
+    prefsTrim.end();
+}
+
+float getArmedNeutralGlidePitch()
+{
+    return armedNeutralGlidePitch;
 }
 
 void setSteeringDifferentialGain(float gain)
@@ -361,6 +395,7 @@ initHoverBias();
     if (prefsTrim.isKey(KEY_RTRIM)) rightTrim = prefsTrim.getInt(KEY_RTRIM, 0);
     if (prefsTrim.isKey(KEY_STRIM)) steeringTrim = prefsTrim.getFloat(KEY_STRIM, 0.0f);
     if (prefsTrim.isKey(KEY_PITCH)) centerAngle = prefsTrim.getFloat(KEY_PITCH, 90.0f);
+    armedNeutralGlidePitch = prefsTrim.getFloat(KEY_ARMED_GLIDE_PITCH, 10.0f);
     if (prefsTrim.isKey(KEY_STEER_DIFF_GAIN)) steeringDifferentialGain = prefsTrim.getFloat(KEY_STEER_DIFF_GAIN, STEERING_DIFF_GAIN_DEFAULT);
     if (prefsTrim.isKey(KEY_TURN_COMP)) turnLiftBoostFraction = prefsTrim.getFloat(KEY_TURN_COMP, TURN_LIFT_BOOST_MAX_FRACTION);
     prefsTrim.end();
@@ -378,6 +413,7 @@ initHoverBias();
     if (turnLiftBoostFraction > TURN_LIFT_BOOST_LIMIT_FRACTION) turnLiftBoostFraction = TURN_LIFT_BOOST_LIMIT_FRACTION;
     if (centerAngle < 80.0f) centerAngle = 80.0f;
     if (centerAngle > 100.0f) centerAngle = 100.0f;
+    armedNeutralGlidePitch = constrain(armedNeutralGlidePitch, 0.0f, 20.0f);
 
     // Apply trims to initial servo positions before attach, so the first PWM
     // pulse is neutral instead of a brief endpoint command.
@@ -407,8 +443,8 @@ previousMicros = now;
     // If a forced center is active, short-circuit and keep servos at center
     if (forceCenterActive)
     {
-        float tgtL = leftNeutralAngle() + leftTrim + rollBiasDegrees;
-        float tgtR = rightNeutralAngle() + rightTrim + rollBiasDegrees;
+        float tgtL = leftIdleNeutralAngle() + leftTrim + rollBiasDegrees;
+        float tgtR = rightIdleNeutralAngle() + rightTrim + rollBiasDegrees;
         writeLeftServoAngle(tgtL);
         writeRightServoAngle(tgtR);
         lastLeftAngle = tgtL;
@@ -536,8 +572,8 @@ float directFinalSteering = 0.0f;
 
         // Apply a lightly smoothed idle lean around the mirrored neutral angles.
         float leanOffset = constrain(finalSteering, -LEAN_MAX_STEERING, LEAN_MAX_STEERING);
-        float newL = leftNeutralAngle() + leftTrim + rollBiasDegrees - leanOffset;
-        float newR = rightNeutralAngle() + rightTrim + rollBiasDegrees - leanOffset;
+        float newL = leftIdleNeutralAngle() + leftTrim + rollBiasDegrees - leanOffset;
+        float newR = rightIdleNeutralAngle() + rightTrim + rollBiasDegrees - leanOffset;
         // Constrain angles to safe servo margins
         newL = constrain(newL, SERVO_SAFE_MIN_ANGLE, SERVO_SAFE_MAX_ANGLE);
         newR = constrain(newR, SERVO_SAFE_MIN_ANGLE, SERVO_SAFE_MAX_ANGLE);
@@ -978,8 +1014,8 @@ void immediateStopAndCenter()
     phase = 0.0f;
 
     // Force servos to center immediately
-    float tgtL = leftNeutralAngle() + leftTrim + rollBiasDegrees;
-    float tgtR = rightNeutralAngle() + rightTrim + rollBiasDegrees;
+    float tgtL = leftIdleNeutralAngle() + leftTrim + rollBiasDegrees;
+    float tgtR = rightIdleNeutralAngle() + rightTrim + rollBiasDegrees;
     idleLeanHold = false;
     idleLeanLeftAngle = tgtL;
     idleLeanRightAngle = tgtR;
@@ -1075,8 +1111,8 @@ float perchWave(float phase)
     if (wrapped < rise)
     {
         float t = wrapped / rise;
-        // ease-out cubic for pleasant rise
-        return 1.0f - powf(1.0f - t, 3);
+        // Smooth acceleration and deceleration into the top hold.
+        return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
     }
     wrapped -= rise;
     if (wrapped < top)
@@ -1087,8 +1123,8 @@ float perchWave(float phase)
     if (wrapped < fall)
     {
         float t = wrapped / fall;
-        // smooth ease-in fall (quadratic)
-        return 1.0f - (t * t);
+        // Smoothly leave the top hold and settle at neutral.
+        return 1.0f - (t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f));
     }
     // neutral hold
     return 0.0f;

@@ -62,6 +62,8 @@ void setServoPitchAngle(float deg);
 void setServoPitchAngleLive(float deg);
 float getServoPitchAngle();
 float getCurrentNeutralAngle();
+void setArmedNeutralGlidePitch(float degrees);
+float getArmedNeutralGlidePitch();
 void setSteeringDifferentialGain(float gain);
 float getSteeringDifferentialGain();
 void setTurnCompensation(float compensation);

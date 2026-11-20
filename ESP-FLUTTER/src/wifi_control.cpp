@@ -1,10 +1,13 @@
 #include "wifi_control.h"
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <Preferences.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_mac.h>
 
 #include "wing_motion.h"
 #include "config.h"
@@ -15,16 +18,19 @@
 #include "led_control.h"
 #include "hardware_config.h"
 #include "esp_flutter_espnow_packet.h"
+#include "esp_flutter_udp_control_packet.h"
 
 WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
+static WiFiUDP udpControl;
 
 // Telemetry broadcast timing
 unsigned long lastTelemetryMillis = 0;
 // forward declare websocket event handler
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+static void updateUdpControl();
 
-const char *ssid = "Butterfly_RC";
+static char ssid[33];
 const char *password = "12345678";
 
 unsigned long lastControlPacket = 0;
@@ -36,6 +42,13 @@ bool batteryAdcSaturated = false;
 float amplitudeScale = UPPER_FLAP_AMPLITUDE_DEFAULT_DEGREES / MAX_UPSTROKE_ABOVE_NEUTRAL;
 static float lowerAmplitudeScale = LOWER_FLAP_AMPLITUDE_DEFAULT_DEGREES / MAX_DOWNSTROKE_BELOW_NEUTRAL;
 static float upperAmplitudeScale = UPPER_FLAP_AMPLITUDE_DEFAULT_DEGREES / MAX_UPSTROKE_ABOVE_NEUTRAL;
+static bool autoAmplitudeEnabled = false;
+static float autoAmplitudeStartLowerDegrees = 75.0f;
+static float autoAmplitudeStartUpperDegrees = 77.0f;
+static float autoAmplitudeEndLowerDegrees = 85.0f;
+static float autoAmplitudeEndUpperDegrees = 88.0f;
+static float effectiveLowerAmplitudeDegrees = LOWER_FLAP_AMPLITUDE_DEFAULT_DEGREES;
+static float effectiveUpperAmplitudeDegrees = UPPER_FLAP_AMPLITUDE_DEFAULT_DEGREES;
 static Preferences prefsControl;
 static const char *CONTROL_PREF_NS = "control";
 static const char *PROTOCOL_PREF_NS = "protocol";
@@ -51,6 +64,11 @@ static const char *KEY_BATT_FS_CUTOFF = "battFsV";
 static const char *KEY_CONTROL_PROTOCOL = "protocol";
 static const char *KEY_LOWER_AMP_SCALE = "lowerAmp";
 static const char *KEY_UPPER_AMP_SCALE = "upperAmp";
+static const char *KEY_AUTO_AMP_ENABLED = "autoAmp";
+static const char *KEY_AUTO_AMP_START_LOWER = "aaStartL";
+static const char *KEY_AUTO_AMP_START_UPPER = "aaStartU";
+static const char *KEY_AUTO_AMP_END_LOWER = "aaEndL";
+static const char *KEY_AUTO_AMP_END_UPPER = "aaEndU";
 static const char *KEY_FLIGHT_RECORD_MS = "recordMs";
 static const char *KEY_CH_MAP_PREFIX = "chMap";
 static unsigned long flightAccumulatedMs = 0;
@@ -61,6 +79,9 @@ static unsigned long flightRecordSessionBaselineMs = 0;
 static bool flightTimerRunning = false;
 static uint32_t lastControlSeq = 0;
 static uint32_t lastReleaseSeq = 0;
+static uint32_t lastUdpControlSeq = 0;
+static unsigned long lastUdpControlMs = 0;
+static bool hasUdpControlSeq = false;
 
 enum ControlProtocol
 {
@@ -358,6 +379,11 @@ static void loadControlPreferences()
     amplitudeScale = prefsControl.getFloat(KEY_AMP_SCALE, amplitudeScale);
     lowerAmplitudeScale = prefsControl.getFloat(KEY_LOWER_AMP_SCALE, lowerAmplitudeScaleFromDegrees(LOWER_FLAP_AMPLITUDE_DEFAULT_DEGREES));
     upperAmplitudeScale = prefsControl.getFloat(KEY_UPPER_AMP_SCALE, upperAmplitudeScaleFromDegrees(UPPER_FLAP_AMPLITUDE_DEFAULT_DEGREES));
+    autoAmplitudeEnabled = prefsControl.getBool(KEY_AUTO_AMP_ENABLED, false);
+    autoAmplitudeStartLowerDegrees = prefsControl.getFloat(KEY_AUTO_AMP_START_LOWER, 75.0f);
+    autoAmplitudeStartUpperDegrees = prefsControl.getFloat(KEY_AUTO_AMP_START_UPPER, 77.0f);
+    autoAmplitudeEndLowerDegrees = prefsControl.getFloat(KEY_AUTO_AMP_END_LOWER, 85.0f);
+    autoAmplitudeEndUpperDegrees = prefsControl.getFloat(KEY_AUTO_AMP_END_UPPER, 88.0f);
     int storedProtocol = prefsControl.getInt(KEY_CONTROL_PROTOCOL, (int)CONTROL_PROTOCOL_WIFI);
     batteryMonitorEnabled = prefsControl.getBool(KEY_BATT_ENABLED, batteryMonitorEnabled);
     batteryDividerTopOhms = prefsControl.getFloat(KEY_BATT_TOP, batteryDividerTopOhms);
@@ -374,6 +400,14 @@ static void loadControlPreferences()
     if (amplitudeScale > 1.0f) amplitudeScale = 1.0f;
     lowerAmplitudeScale = lowerAmplitudeScaleFromDegrees(lowerAmplitudeDegreesFromScale(lowerAmplitudeScale));
     upperAmplitudeScale = upperAmplitudeScaleFromDegrees(upperAmplitudeDegreesFromScale(upperAmplitudeScale));
+    autoAmplitudeStartLowerDegrees = lowerAmplitudeDegreesFromScale(
+        lowerAmplitudeScaleFromDegrees(autoAmplitudeStartLowerDegrees));
+    autoAmplitudeStartUpperDegrees = upperAmplitudeDegreesFromScale(
+        upperAmplitudeScaleFromDegrees(autoAmplitudeStartUpperDegrees));
+    autoAmplitudeEndLowerDegrees = lowerAmplitudeDegreesFromScale(
+        lowerAmplitudeScaleFromDegrees(autoAmplitudeEndLowerDegrees));
+    autoAmplitudeEndUpperDegrees = upperAmplitudeDegreesFromScale(
+        upperAmplitudeScaleFromDegrees(autoAmplitudeEndUpperDegrees));
     if (batteryDividerTopOhms >= 1.0f && batteryDividerTopOhms < 1000.0f) batteryDividerTopOhms *= 1000.0f;
     if (batteryDividerBottomOhms >= 1.0f && batteryDividerBottomOhms < 1000.0f) batteryDividerBottomOhms *= 1000.0f;
     if (batteryDividerTopOhms < 1.0f) batteryDividerTopOhms = BATTERY_DIVIDER_TOP_OHMS;
@@ -419,6 +453,17 @@ static void saveAmplitudeScale()
     prefsControl.end();
 }
 
+static void saveAutoAmplitudeConfig()
+{
+    prefsControl.begin(CONTROL_PREF_NS, false);
+    prefsControl.putBool(KEY_AUTO_AMP_ENABLED, autoAmplitudeEnabled);
+    prefsControl.putFloat(KEY_AUTO_AMP_START_LOWER, autoAmplitudeStartLowerDegrees);
+    prefsControl.putFloat(KEY_AUTO_AMP_START_UPPER, autoAmplitudeStartUpperDegrees);
+    prefsControl.putFloat(KEY_AUTO_AMP_END_LOWER, autoAmplitudeEndLowerDegrees);
+    prefsControl.putFloat(KEY_AUTO_AMP_END_UPPER, autoAmplitudeEndUpperDegrees);
+    prefsControl.end();
+}
+
 static float lowerAmplitudeDegreesFromScale(float scale)
 {
     return constrain(scale * MAX_DOWNSTROKE_BELOW_NEUTRAL,
@@ -449,6 +494,40 @@ static float upperAmplitudeScaleFromDegrees(float degrees)
     return degrees / MAX_UPSTROKE_ABOVE_NEUTRAL;
 }
 
+static void applyConfiguredAmplitudeScales()
+{
+    if (!autoAmplitudeEnabled)
+    {
+        effectiveLowerAmplitudeDegrees = lowerAmplitudeDegreesFromScale(lowerAmplitudeScale);
+        effectiveUpperAmplitudeDegrees = upperAmplitudeDegreesFromScale(upperAmplitudeScale);
+        setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+        return;
+    }
+
+    const float startVoltage = 8.4f;
+    float blend = 0.0f;
+    if (batteryMonitorEnabled && cachedBatteryVoltage > 0.1f &&
+        batteryFailsafeCutoffVoltage < startVoltage)
+    {
+        blend = constrain(
+            (startVoltage - cachedBatteryVoltage) /
+                (startVoltage - batteryFailsafeCutoffVoltage),
+            0.0f,
+            1.0f);
+    }
+    float lowerDegrees = autoAmplitudeStartLowerDegrees +
+        blend * (autoAmplitudeEndLowerDegrees - autoAmplitudeStartLowerDegrees);
+    float upperDegrees = autoAmplitudeStartUpperDegrees +
+        blend * (autoAmplitudeEndUpperDegrees - autoAmplitudeStartUpperDegrees);
+    effectiveLowerAmplitudeDegrees = lowerAmplitudeDegreesFromScale(
+        lowerAmplitudeScaleFromDegrees(lowerDegrees));
+    effectiveUpperAmplitudeDegrees = upperAmplitudeDegreesFromScale(
+        upperAmplitudeScaleFromDegrees(upperDegrees));
+    setFlapAmplitudeScales(
+        lowerAmplitudeScaleFromDegrees(effectiveLowerAmplitudeDegrees),
+        upperAmplitudeScaleFromDegrees(effectiveUpperAmplitudeDegrees));
+}
+
 static void saveControlProtocol()
 {
     prefsControl.begin(CONTROL_PREF_NS, false);
@@ -467,7 +546,7 @@ static void applyCurrentFlightProfile()
     lowerAmplitudeScale = settings.lowerAmplitudeScale;
     upperAmplitudeScale = settings.upperAmplitudeScale;
     amplitudeScale = fmaxf(lowerAmplitudeScale, upperAmplitudeScale);
-    setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+    applyConfiguredAmplitudeScales();
     setSteeringDifferentialGain(settings.steeringGain);
     setTurnCompensation(settings.turnCompensation);
     setServoPitchAngle(settings.neutralPitch);
@@ -652,6 +731,7 @@ static void updateCachedBatteryTelemetry(bool force)
         return;
 
     cachedBatteryVoltage = readBatteryVoltage();
+    applyConfiguredAmplitudeScales();
     cachedBatteryPercent = batteryVoltageToPercent(cachedBatteryVoltage);
     cachedBatteryLow = updateBatteryWarningState(cachedBatteryVoltage);
     cachedBatteryCritical = isBatteryCritical(cachedBatteryVoltage);
@@ -697,6 +777,7 @@ static void disableWifiForElrsIsolation()
         return;
     webSocket.close();
     server.stop();
+    udpControl.stop();
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
@@ -873,7 +954,7 @@ body{background:var(--bg);color:var(--text);font-family:Helvetica,Arial,sans-ser
             </div>
             <div class="telemetry-tables">
                 <table class="tele-table">
-                    <tr><td>Amplitude</td><td id="tAmp">-</td></tr>
+                    <tr><td>Average Amplitude</td><td id="tAmp">-</td></tr>
                     <tr><td>Neutral Pitch</td><td id="tNeutral">-</td></tr>
                 </table>
                 <table class="tele-table">
@@ -1182,7 +1263,46 @@ function updateAmplitudeDisplay(data){
         window._upperAmpSlider.value=deg;
         if (window._upperAmpVal) window._upperAmpVal.innerText=deg+'\u00B0';
     }
+    updateAutoAmplitudeUi(data);
+    const glidePitch = document.getElementById('armedGlidePitchSlider');
+    const glideValue = document.getElementById('armedGlidePitchValue');
+    if (typeof data.armedGlidePitch !== 'undefined' && glidePitch &&
+        document.activeElement !== glidePitch) {
+        glidePitch.value = Math.round(data.armedGlidePitch);
+        if (glideValue) glideValue.innerText = glidePitch.value + '\u00B0';
+    }
     window._ampInitialized=true;
+}
+function updateAutoAmplitudeUi(data){
+    const enabled = document.getElementById('autoAmplitudeEnable');
+    const manualLower = document.getElementById('lowerAmpSlider');
+    const manualUpper = document.getElementById('upperAmpSlider');
+    const autoGrid = document.getElementById('autoAmplitudeGrid');
+    if (!enabled || !manualLower || !manualUpper || !autoGrid) return;
+    if (typeof data.autoAmplitudeEnabled !== 'undefined') enabled.checked = !!data.autoAmplitudeEnabled;
+    const auto = enabled.checked;
+    manualLower.closest('.slider-section').style.display = auto ? 'none' : '';
+    manualUpper.closest('.slider-section').style.display = auto ? 'none' : '';
+    autoGrid.style.display = auto ? 'grid' : 'none';
+    const note = document.getElementById('autoAmplitudeNote');
+    if (note && typeof data.batteryFailsafeCutoff !== 'undefined') {
+        note.innerText = 'Interpolates from 8.4V to configured cutoff (' +
+            Number(data.batteryFailsafeCutoff).toFixed(2) + 'V).';
+    }
+    const values = [
+        ['autoStartLowerSlider', 'autoStartLowerValue', data.autoAmplitudeStartLower],
+        ['autoStartUpperSlider', 'autoStartUpperValue', data.autoAmplitudeStartUpper],
+        ['autoEndLowerSlider', 'autoEndLowerValue', data.autoAmplitudeEndLower],
+        ['autoEndUpperSlider', 'autoEndUpperValue', data.autoAmplitudeEndUpper]
+    ];
+    values.forEach(([sliderId, valueId, value])=>{
+        const slider = document.getElementById(sliderId);
+        const label = document.getElementById(valueId);
+        if (slider && typeof value !== 'undefined' && document.activeElement !== slider) {
+            slider.value = Math.round(value);
+            if (label) label.innerText = slider.value + '\u00B0';
+        }
+    });
 }
 function updateArmDisplay(mode){
     currentModeName = mode || 'UNKNOWN';
@@ -1356,7 +1476,7 @@ function initWebSocket(){
         catch(e){ console.log('WS parse err', e); return; }
         updateThrottleDisplay(data);
         updateBatteryDisplay(data);
-        document.getElementById('tAmp').innerText = formatDegrees(data.amplitude);
+        document.getElementById('tAmp').innerText = formatDegrees(data.averageAmplitudeDegrees);
         updateAmplitudeDisplay(data);
         updateTimerDisplay(data);
         updateHoverBiasDisplay(data);
@@ -1387,7 +1507,7 @@ fetch('/telemetry').then(r=>r.json()).then(function(data){
     try{
         updateThrottleDisplay(data);
         updateBatteryDisplay(data);
-        if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(data.amplitude);
+        if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(data.averageAmplitudeDegrees);
         updateAmplitudeDisplay(data);
         updateTimerDisplay(data);
         updateHoverBiasDisplay(data);
@@ -1421,7 +1541,7 @@ setInterval(function(){
             // full update for live fields
             updateThrottleDisplay(data);
             updateBatteryDisplay(data);
-            if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(data.amplitude);
+            if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(data.averageAmplitudeDegrees);
             updateAmplitudeDisplay(data);
             updateTimerDisplay(data);
             updateHoverBiasDisplay(data);
@@ -1515,7 +1635,7 @@ protocolLabel.innerText='Protocol';
 const protocolSelect = document.createElement('select');
 protocolSelect.id='protocolSelect';
 protocolSelect.style.background='var(--panel)'; protocolSelect.style.color='var(--text)'; protocolSelect.style.border='2px solid var(--accent)'; protocolSelect.style.borderRadius='8px'; protocolSelect.style.padding='7px 10px'; protocolSelect.style.fontWeight='700'; protocolSelect.style.minWidth='150px';
-protocolSelect.innerHTML='<option value="0">WiFi (App)</option><option value="1">ESP-NOW</option><option value="2">ELRS</option>';
+protocolSelect.innerHTML='<option value="0">WiFi (App / UDP native)</option><option value="1">ESP-NOW</option><option value="2">ELRS</option>';
 protocolSelect.onchange=()=>{
     const p = Math.max(0, Math.min(2, parseInt(protocolSelect.value || '0', 10)));
     if (p !== 0 && wifiControlActive()) {
@@ -1714,6 +1834,64 @@ function makeAmplitudeBar(title, sliderId, valueId, minDeg, maxDeg, defaultDeg, 
 const lowerAmp = makeAmplitudeBar('Lower Amplitude', 'lowerAmpSlider', 'lowerAmpVal', 50, 90, 75, 'Reset Lower Amplitude to default', '/setLowerAmpScale');
 const upperAmp = makeAmplitudeBar('Upper Amplitude', 'upperAmpSlider', 'upperAmpVal', 50, 90, 75, 'Reset Upper Amplitude to default', '/setUpperAmpScale');
 
+const autoAmplitudeBar = document.createElement('div'); autoAmplitudeBar.className='slider-section';
+const autoAmplitudeLabel = document.createElement('label');
+autoAmplitudeLabel.style.display='flex'; autoAmplitudeLabel.style.alignItems='center'; autoAmplitudeLabel.style.justifyContent='center'; autoAmplitudeLabel.style.gap='8px'; autoAmplitudeLabel.style.color='var(--text)'; autoAmplitudeLabel.style.fontWeight='700';
+const autoAmplitudeEnable = document.createElement('input'); autoAmplitudeEnable.type='checkbox'; autoAmplitudeEnable.id='autoAmplitudeEnable';
+autoAmplitudeLabel.appendChild(autoAmplitudeEnable);
+autoAmplitudeLabel.appendChild(document.createTextNode('Auto Amplitude (battery compensation)'));
+const autoAmplitudeNote = document.createElement('div'); autoAmplitudeNote.id='autoAmplitudeNote'; autoAmplitudeNote.style.color='var(--muted)'; autoAmplitudeNote.style.fontSize='11px'; autoAmplitudeNote.innerText='Interpolates from 8.4V to the configured servo cutoff voltage.';
+autoAmplitudeBar.appendChild(autoAmplitudeLabel);
+autoAmplitudeBar.appendChild(autoAmplitudeNote);
+function makeAutoAmplitudeSlider(label, id, valueId, initialValue){
+    const wrap = document.createElement('div'); wrap.className='slider-section';
+    const title = document.createElement('div'); title.style.color='var(--text)'; title.innerHTML='<strong>' + label + ':</strong> <span id="' + valueId + '">' + initialValue + '\u00B0</span>';
+    const slider = document.createElement('input'); slider.type='range'; slider.min=50; slider.max=90; slider.step=1; slider.value=initialValue; slider.id=id;
+    wrap.appendChild(title); wrap.appendChild(slider);
+    return {wrap:wrap, slider:slider, value:title.querySelector('span')};
+}
+const autoStartLower = makeAutoAmplitudeSlider('Start Lower (8.4V)', 'autoStartLowerSlider', 'autoStartLowerValue', 75);
+const autoStartUpper = makeAutoAmplitudeSlider('Start Upper (8.4V)', 'autoStartUpperSlider', 'autoStartUpperValue', 77);
+const autoEndLower = makeAutoAmplitudeSlider('End Lower (cutoff)', 'autoEndLowerSlider', 'autoEndLowerValue', 85);
+const autoEndUpper = makeAutoAmplitudeSlider('End Upper (cutoff)', 'autoEndUpperSlider', 'autoEndUpperValue', 88);
+const autoAmplitudeGrid = document.createElement('div'); autoAmplitudeGrid.className='prefs-grid'; autoAmplitudeGrid.id='autoAmplitudeGrid'; autoAmplitudeGrid.style.display='none';
+[autoStartLower, autoStartUpper, autoEndLower, autoEndUpper].forEach(item=>autoAmplitudeGrid.appendChild(item.wrap));
+autoAmplitudeBar.appendChild(autoAmplitudeGrid);
+function sendAutoAmplitudeConfig(){
+    const params = `enabled=${autoAmplitudeEnable.checked ? 1 : 0}&startLower=${autoStartLower.slider.value}&startUpper=${autoStartUpper.slider.value}&endLower=${autoEndLower.slider.value}&endUpper=${autoEndUpper.slider.value}`;
+    fetch(`/setAutoAmplitude?${params}`).catch(()=>{});
+}
+let autoAmplitudeDebounce = null;
+function updateAutoAmplitudeValues(){
+    autoStartLower.value.innerText = autoStartLower.slider.value + '\u00B0';
+    autoStartUpper.value.innerText = autoStartUpper.slider.value + '\u00B0';
+    autoEndLower.value.innerText = autoEndLower.slider.value + '\u00B0';
+    autoEndUpper.value.innerText = autoEndUpper.slider.value + '\u00B0';
+}
+function queueAutoAmplitudeConfig(){
+    updateAutoAmplitudeValues();
+    clearTimeout(autoAmplitudeDebounce);
+    autoAmplitudeDebounce = setTimeout(sendAutoAmplitudeConfig, 100);
+}
+[autoStartLower.slider, autoStartUpper.slider, autoEndLower.slider, autoEndUpper.slider].forEach(slider=>{
+    slider.addEventListener('input', ()=>{
+        if (slider === autoStartLower.slider && Number(slider.value) > Number(autoEndLower.slider.value))
+            autoEndLower.slider.value = slider.value;
+        if (slider === autoEndLower.slider && Number(slider.value) < Number(autoStartLower.slider.value))
+            autoStartLower.slider.value = slider.value;
+        if (slider === autoStartUpper.slider && Number(slider.value) > Number(autoEndUpper.slider.value))
+            autoEndUpper.slider.value = slider.value;
+        if (slider === autoEndUpper.slider && Number(slider.value) < Number(autoStartUpper.slider.value))
+            autoStartUpper.slider.value = slider.value;
+        queueAutoAmplitudeConfig();
+    });
+    slider.addEventListener('change', sendAutoAmplitudeConfig);
+});
+autoAmplitudeEnable.addEventListener('change', ()=>{
+    updateAutoAmplitudeUi({autoAmplitudeEnabled:autoAmplitudeEnable.checked});
+    sendAutoAmplitudeConfig();
+});
+
 const servoMinBar = document.createElement('div'); servoMinBar.className='slider-section';
 const servoMinLabel = document.createElement('div'); servoMinLabel.style.color='var(--text)'; servoMinLabel.style.textAlign='center'; servoMinLabel.innerHTML='<strong>Servo Min Pulse:</strong> <span id="servoMinVal">500 us</span>';
 const servoMinSlider = document.createElement('input'); servoMinSlider.type='range'; servoMinSlider.min=500; servoMinSlider.max=1200; servoMinSlider.value=500; servoMinSlider.step=100; servoMinSlider.style.width='220px'; servoMinSlider.id='servoMinSlider';
@@ -1880,8 +2058,22 @@ pitchBar.appendChild(hoverNeutral.wrap);
 pitchBar.appendChild(hoverSensorStatus);
 pitchBar.appendChild(hoverTitle);
 
+const armedGlidePitchBar = document.createElement('div'); armedGlidePitchBar.className='slider-section';
+const armedGlidePitchLabel = document.createElement('div'); armedGlidePitchLabel.style.color='var(--text)'; armedGlidePitchLabel.innerHTML='<strong>Armed Neutral Glide Pitch:</strong> <span id="armedGlidePitchValue">10\u00B0</span>';
+const armedGlidePitchSlider = document.createElement('input'); armedGlidePitchSlider.type='range'; armedGlidePitchSlider.min=0; armedGlidePitchSlider.max=20; armedGlidePitchSlider.step=1; armedGlidePitchSlider.value=10; armedGlidePitchSlider.id='armedGlidePitchSlider';
+const armedGlidePitchRow = document.createElement('div'); armedGlidePitchRow.className='wide-slider-row'; armedGlidePitchRow.appendChild(armedGlidePitchSlider);
+armedGlidePitchBar.appendChild(armedGlidePitchLabel); armedGlidePitchBar.appendChild(armedGlidePitchRow);
+armedGlidePitchSlider.addEventListener('input', ()=>{
+    document.getElementById('armedGlidePitchValue').innerText = armedGlidePitchSlider.value + '\u00B0';
+});
+armedGlidePitchSlider.addEventListener('change', ()=>{
+    fetch(`/setArmedGlidePitch?degrees=${armedGlidePitchSlider.value}`).catch(()=>{});
+});
+prefsDiv.appendChild(armedGlidePitchBar);
+
 prefsDiv.appendChild(lowerAmp.bar);
 prefsDiv.appendChild(upperAmp.bar);
+prefsDiv.appendChild(autoAmplitudeBar);
 prefsDiv.appendChild(pitchBar);
 
 // Motion steering controls
@@ -1918,6 +2110,8 @@ prefsDiv.insertBefore(gridTrims, profileNotice.nextSibling);
 prefsDiv.insertBefore(gridSteering, gridTrims.nextSibling);
 prefsDiv.insertBefore(upperAmp.bar, pitchBar);
 prefsDiv.insertBefore(lowerAmp.bar, pitchBar);
+prefsDiv.insertBefore(autoAmplitudeBar, lowerAmp.bar);
+prefsDiv.insertBefore(armedGlidePitchBar, pitchBar.nextSibling);
 prefsDiv.insertBefore(gridFrequency, pitchBar);
 prefsDiv.insertBefore(gridServoPulse, pitchBar);
 prefsDiv.insertBefore(hardwarePinsBar, pitchBar);
@@ -2344,7 +2538,7 @@ for (const item of [hoverForward, hoverNeutral]) {
             updateHoverBiasDisplay(window.__initTelemetry);
             updateLedDisplay(window.__initTelemetry);
             updateFlightProfileDisplay(window.__initTelemetry);
-            if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(window.__initTelemetry.amplitude);
+            if (document.getElementById('tAmp')) document.getElementById('tAmp').innerText = formatDegrees(window.__initTelemetry.averageAmplitudeDegrees);
             if (document.getElementById('tPilot')) document.getElementById('tPilot').innerText = (window.__initTelemetry.pilot||0).toFixed(2);
             updateArmDisplay(window.__initTelemetry.mode || 'UNKNOWN');
         } catch(e) {}
@@ -2506,7 +2700,7 @@ static void applyEspNowPacket(const EspFlutterNowPacket &packet)
         amplitudeScale = constrain(packet.amplitudeScale, 0.60f, 1.00f);
         lowerAmplitudeScale = lowerAmplitudeScaleFromDegrees(amplitudeScale * MAX_DOWNSTROKE_BELOW_NEUTRAL);
         upperAmplitudeScale = upperAmplitudeScaleFromDegrees(amplitudeScale * MAX_UPSTROKE_ABOVE_NEUTRAL);
-        setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+        applyConfiguredAmplitudeScales();
         setCurrentProfileLowerAmplitudeScale(lowerAmplitudeScale);
         setCurrentProfileUpperAmplitudeScale(upperAmplitudeScale);
         saveAmplitudeScale();
@@ -3517,15 +3711,81 @@ void handleControl()
     server.send(200, "text/plain", "OK");
 }
 
+static void updateUdpControl()
+{
+    for (uint8_t packetsProcessed = 0; packetsProcessed < 4; ++packetsProcessed)
+    {
+        int packetSize = udpControl.parsePacket();
+        if (packetSize <= 0)
+            return;
+
+        EspFlutterUdpControlPacket packet;
+        if (packetSize != (int)sizeof(packet) ||
+            udpControl.read((uint8_t *)&packet, sizeof(packet)) != (int)sizeof(packet))
+        {
+            while (udpControl.available())
+                udpControl.read();
+            continue;
+        }
+
+        if (controlProtocol != CONTROL_PROTOCOL_WIFI ||
+            packet.magic != ESP_FLUTTER_UDP_CONTROL_MAGIC ||
+            packet.version != ESP_FLUTTER_UDP_CONTROL_VERSION ||
+            packet.flags != 0 ||
+            packet.sequence == 0 ||
+            packet.steering < -1000 || packet.steering > 1000 ||
+            packet.throttle > 1000)
+            continue;
+
+        if (hasUdpControlSeq && millis() - lastUdpControlMs > 1000UL)
+            hasUdpControlSeq = false;
+        if (hasUdpControlSeq &&
+            (int32_t)(packet.sequence - lastUdpControlSeq) <= 0)
+            continue;
+
+        lastUdpControlSeq = packet.sequence;
+        lastUdpControlMs = millis();
+        hasUdpControlSeq = true;
+        char command[40];
+        int commandLength = snprintf(
+            command,
+            sizeof(command),
+            "ctl 0 %.3f %.3f",
+            packet.steering / 1000.0f,
+            packet.throttle / 1000.0f);
+        if (commandLength > 0 && commandLength < (int)sizeof(command))
+            webSocketEvent(0, WStype_TEXT, (uint8_t *)command, (size_t)commandLength);
+    }
+}
+
 void initWiFiControl()
 {
     loadControlPreferences();
     initFlightProfiles();
     applyCurrentFlightProfile();
 
+    uint8_t apMac[6];
+    esp_err_t macResult = esp_read_mac(apMac, ESP_MAC_WIFI_SOFTAP);
+    if (macResult != ESP_OK)
+    {
+        Serial.printf("Failed to read SoftAP MAC for unique SSID: %d\n", (int)macResult);
+        return;
+    }
+    snprintf(ssid, sizeof(ssid), "Butterfly_RC_%02X%02X%02X%02X%02X%02X",
+        apMac[0], apMac[1], apMac[2], apMac[3], apMac[4], apMac[5]);
+
     WiFi.mode(WIFI_AP);
-    WiFi.setTxPower(WIFI_POWER_2dBm);
-    WiFi.softAP(ssid, password, WIFI_AP_CHANNEL);
+    WiFi.setSleep(false);
+    WiFi.softAP(ssid, password, WIFI_AP_CHANNEL, false, 3);
+    esp_err_t txPowerResult = esp_wifi_set_max_tx_power(60);
+    if (txPowerResult != ESP_OK)
+        Serial.printf("Failed to set WiFi TX power to 15 dBm: %d\n", (int)txPowerResult);
+    if (!udpControl.begin(ESP_FLUTTER_UDP_CONTROL_PORT))
+        Serial.printf("Failed to start UDP control listener on port %u\n",
+            (unsigned)ESP_FLUTTER_UDP_CONTROL_PORT);
+    else
+        Serial.printf("UDP control listener ready on port %u\n",
+            (unsigned)ESP_FLUTTER_UDP_CONTROL_PORT);
     initEspNowReceiver();
     Serial1.setRxBufferSize(2048);
     Serial1.begin(ELRS_BAUD, SERIAL_8N1, getElrsRxPin(), getElrsTxPin());
@@ -3536,7 +3796,7 @@ void initWiFiControl()
     }
 
     Serial.println("");
-    Serial.println("WiFi AP Started");
+    Serial.printf("WiFi AP Started: %s on channel %u\n", ssid, WIFI_AP_CHANNEL);
 
     Serial.print("IP Address: ");
     Serial.println(WiFi.softAPIP());
@@ -3684,6 +3944,35 @@ void initWiFiControl()
         server.send(200, "text/plain", "OK");
     });
 
+    server.on("/setAutoAmplitude", []()
+    {
+        if (!server.hasArg("enabled") || !server.hasArg("startLower") ||
+            !server.hasArg("startUpper") || !server.hasArg("endLower") ||
+            !server.hasArg("endUpper"))
+        {
+            server.send(400, "text/plain", "missing auto amplitude settings");
+            return;
+        }
+
+        autoAmplitudeEnabled = server.arg("enabled").toInt() != 0;
+        autoAmplitudeStartLowerDegrees = lowerAmplitudeDegreesFromScale(
+            lowerAmplitudeScaleFromDegrees(server.arg("startLower").toFloat()));
+        autoAmplitudeStartUpperDegrees = upperAmplitudeDegreesFromScale(
+            upperAmplitudeScaleFromDegrees(server.arg("startUpper").toFloat()));
+        autoAmplitudeEndLowerDegrees = fmaxf(
+            autoAmplitudeStartLowerDegrees,
+            lowerAmplitudeDegreesFromScale(
+                lowerAmplitudeScaleFromDegrees(server.arg("endLower").toFloat())));
+        autoAmplitudeEndUpperDegrees = fmaxf(
+            autoAmplitudeStartUpperDegrees,
+            upperAmplitudeDegreesFromScale(
+                upperAmplitudeScaleFromDegrees(server.arg("endUpper").toFloat())));
+
+        saveAutoAmplitudeConfig();
+        applyConfiguredAmplitudeScales();
+        server.send(200, "text/plain", "OK");
+    });
+
     // Telemetry endpoint used by web UI (~8Hz)
     server.on("/telemetry", []()
     {
@@ -3703,12 +3992,19 @@ void initWiFiControl()
         json += "\"frequency\":" + String(freq, 3) + ",";
         json += "\"amplitude\":" + String(getFlapAmplitude(), 3) + ",";
         json += "\"amplitudePct\":" + String(getFlapAmplitude() / MAX_FLAP_AMPLITUDE, 3) + ",";
+        json += "\"averageAmplitudeDegrees\":" +
+            String((effectiveLowerAmplitudeDegrees + effectiveUpperAmplitudeDegrees) * 0.5f, 1) + ",";
         // Expose current amplitude scale (0.6..1.0).
         json += "\"amplitudeScale\":" + String(amplitudeScale, 3) + ",";
         json += "\"lowerAmplitudeScale\":" + String(lowerAmplitudeScale, 3) + ",";
         json += "\"upperAmplitudeScale\":" + String(upperAmplitudeScale, 3) + ",";
         json += "\"lowerAmplitudeDegrees\":" + String(lowerAmplitudeScale * MAX_DOWNSTROKE_BELOW_NEUTRAL, 1) + ",";
         json += "\"upperAmplitudeDegrees\":" + String(upperAmplitudeScale * MAX_UPSTROKE_ABOVE_NEUTRAL, 1) + ",";
+        json += "\"autoAmplitudeEnabled\":" + String(autoAmplitudeEnabled ? 1 : 0) + ",";
+        json += "\"autoAmplitudeStartLower\":" + String(autoAmplitudeStartLowerDegrees, 1) + ",";
+        json += "\"autoAmplitudeStartUpper\":" + String(autoAmplitudeStartUpperDegrees, 1) + ",";
+        json += "\"autoAmplitudeEndLower\":" + String(autoAmplitudeEndLowerDegrees, 1) + ",";
+        json += "\"autoAmplitudeEndUpper\":" + String(autoAmplitudeEndUpperDegrees, 1) + ",";
         json += "\"maxFlapDegrees\":" + String(fmaxf(MAX_UPSTROKE_ABOVE_NEUTRAL, MAX_DOWNSTROKE_BELOW_NEUTRAL), 1) + ",";
         json += "\"steeringDiffGain\":" + String(getSteeringDifferentialGain(), 3) + ",";
         json += "\"turnCompensation\":" + String(getTurnCompensation(), 3) + ",";
@@ -3785,6 +4081,7 @@ void initWiFiControl()
         json += "\"uptimeMs\":" + String(millis()) + ",";
         json += "\"pilot\":" + String(getPilotSteeringCurrent(), 3) + ",";
         json += "\"servoPitch\":" + String(getServoPitchAngle(), 3) + ",";
+        json += "\"armedGlidePitch\":" + String(getArmedNeutralGlidePitch(), 1) + ",";
         json += "\"currentNeutralAngle\":" + String(getCurrentNeutralAngle(), 3) + ",";
         json += "\"hoverBiasEnabled\":" + String(isHoverBiasEnabled() ? 1 : 0) + ",";
         json += "\"hoverBias\":" + String(getHoverBias(), 3) + ",";
@@ -3872,7 +4169,7 @@ void initWiFiControl()
         amplitudeScale = v;
         lowerAmplitudeScale = lowerAmplitudeScaleFromDegrees(v * MAX_DOWNSTROKE_BELOW_NEUTRAL);
         upperAmplitudeScale = upperAmplitudeScaleFromDegrees(v * MAX_UPSTROKE_ABOVE_NEUTRAL);
-        setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+        applyConfiguredAmplitudeScales();
         setCurrentProfileLowerAmplitudeScale(lowerAmplitudeScale);
         setCurrentProfileUpperAmplitudeScale(upperAmplitudeScale);
         saveAmplitudeScale();
@@ -3897,7 +4194,7 @@ void initWiFiControl()
         }
         lowerAmplitudeScale = v;
         amplitudeScale = fmaxf(lowerAmplitudeScale, upperAmplitudeScale);
-        setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+        applyConfiguredAmplitudeScales();
         setCurrentProfileLowerAmplitudeScale(v);
         saveAmplitudeScale();
         server.send(200, "text/plain", "OK");
@@ -3921,7 +4218,7 @@ void initWiFiControl()
         }
         upperAmplitudeScale = v;
         amplitudeScale = fmaxf(lowerAmplitudeScale, upperAmplitudeScale);
-        setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+        applyConfiguredAmplitudeScales();
         setCurrentProfileUpperAmplitudeScale(v);
         saveAmplitudeScale();
         server.send(200, "text/plain", "OK");
@@ -3989,6 +4286,17 @@ void initWiFiControl()
         if (v > 100.0f) v = 100.0f;
         setServoPitchAngle(v);
         setCurrentProfileNeutralPitch(getServoPitchAngle());
+        server.send(200, "text/plain", "OK");
+    });
+
+    server.on("/setArmedGlidePitch", []()
+    {
+        if (!server.hasArg("degrees"))
+        {
+            server.send(400, "text/plain", "missing glide pitch");
+            return;
+        }
+        setArmedNeutralGlidePitch(server.arg("degrees").toFloat());
         server.send(200, "text/plain", "OK");
     });
 
@@ -4184,6 +4492,7 @@ void updateWiFiControl()
     {
         server.handleClient();
         webSocket.loop();
+        updateUdpControl();
     }
 
     if (controlProtocol == CONTROL_PROTOCOL_ELRS)
@@ -4226,7 +4535,7 @@ void updateWiFiControl()
     }
 
     // Telemetry broadcast via WebSocket (if any clients connected).
-    const unsigned long telemetryInterval = 50UL;
+    const unsigned long telemetryInterval = 200UL;
     if (webSocket.connectedClients() > 0 && millis() - lastTelemetryMillis > telemetryInterval)
     {
         lastTelemetryMillis = millis();
@@ -4238,17 +4547,22 @@ void updateWiFiControl()
         float battPct = cachedBatteryPercent;
         bool battLow = cachedBatteryLow;
         bool battCritical = cachedBatteryCritical;
-        String modeStr = "UNKNOWN";
+        const char *modeStr = "UNKNOWN";
         switch (getFlightMode()) { case FLIGHT_MODE_DISARMED: modeStr = "DISARMED"; break; case FLIGHT_MODE_ARMED: modeStr = "ARMED"; break; case FLIGHT_MODE_PERCH: modeStr = "PERCH"; break; }
-        char json[900];
+        char json[1200];
         snprintf(json, sizeof(json),
             "{\"throttle\":%.3f,\"frequency\":%.3f,\"amplitude\":%.3f,"
+            "\"averageAmplitudeDegrees\":%.1f,"
             "\"lowerAmplitudeScale\":%.3f,\"upperAmplitudeScale\":%.3f,"
             "\"lowerAmplitudeDegrees\":%.1f,\"upperAmplitudeDegrees\":%.1f,"
+            "\"autoAmplitudeEnabled\":%d,\"autoAmplitudeStartLower\":%.1f,"
+            "\"autoAmplitudeStartUpper\":%.1f,\"autoAmplitudeEndLower\":%.1f,"
+            "\"autoAmplitudeEndUpper\":%.1f,"
             "\"pilot\":%.3f,\"flightProfile\":%d,\"flightProfileName\":\"%s\","
             "\"frequencyCap\":%.3f,\"waveform\":%d,\"controlProtocol\":%d,"
             "\"steeringLock\":%d,\"currentFlightMs\":%lu,\"flightMs\":%lu,"
             "\"recordMs\":%lu,\"uptimeMs\":%lu,\"servoPitch\":%.3f,"
+            "\"armedGlidePitch\":%.1f,"
             "\"currentNeutralAngle\":%.3f,\"hoverBiasEnabled\":%d,"
             "\"hoverBias\":%.3f,\"hoverDevicePitch\":%.3f,\"ledMode\":%d,"
             "\"ledBrightness\":%d,\"ledSpeed\":%d,\"battery\":%.3f,"
@@ -4258,20 +4572,24 @@ void updateWiFiControl()
             "\"leftTrim\":%d,\"rightTrim\":%d,\"steeringTrim\":%.3f,"
             "\"mode\":\"%s\"}",
             telemetryThrottle, freq, getFlapAmplitude(),
+            (effectiveLowerAmplitudeDegrees + effectiveUpperAmplitudeDegrees) * 0.5f,
             lowerAmplitudeScale, upperAmplitudeScale,
             lowerAmplitudeScale * MAX_DOWNSTROKE_BELOW_NEUTRAL,
             upperAmplitudeScale * MAX_UPSTROKE_ABOVE_NEUTRAL,
+            autoAmplitudeEnabled ? 1 : 0,
+            autoAmplitudeStartLowerDegrees, autoAmplitudeStartUpperDegrees,
+            autoAmplitudeEndLowerDegrees, autoAmplitudeEndUpperDegrees,
             getPilotSteeringCurrent(), (int)getFlightProfileMode(), getFlightProfileName(),
             getProfileFrequencyCap(), getFlapWaveform(), (int)controlProtocol,
             steeringLockEnabled ? 1 : 0,
             getCurrentFlightSessionMs(), getFlightTimerMs(), getFlightRecordMs(), millis(),
-            getServoPitchAngle(), getCurrentNeutralAngle(),
+            getServoPitchAngle(), getArmedNeutralGlidePitch(), getCurrentNeutralAngle(),
             isHoverBiasEnabled() ? 1 : 0, getHoverBias(), getHoverBiasDevicePitch(),
             getLedMode(), getLedBrightnessLevel(), getLedEffectSpeedLevel(),
             battV, battPct, battLow ? 1 : 0, battCritical ? 1 : 0,
             batteryMonitorEnabled ? 1 : 0, batteryFailsafeEnabled ? 1 : 0,
             batteryFailsafeCutoffVoltage, batteryServoFailsafeActive ? 1 : 0,
-            getLeftTrim(), getRightTrim(), getSteeringTrim(), modeStr.c_str());
+            getLeftTrim(), getRightTrim(), getSteeringTrim(), modeStr);
 
         webSocket.broadcastTXT(json);
     }
@@ -4406,7 +4724,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             amplitudeScale = v;
             lowerAmplitudeScale = lowerAmplitudeScaleFromDegrees(v * MAX_DOWNSTROKE_BELOW_NEUTRAL);
             upperAmplitudeScale = upperAmplitudeScaleFromDegrees(v * MAX_UPSTROKE_ABOVE_NEUTRAL);
-            setFlapAmplitudeScales(lowerAmplitudeScale, upperAmplitudeScale);
+            applyConfiguredAmplitudeScales();
             setCurrentProfileLowerAmplitudeScale(lowerAmplitudeScale);
             setCurrentProfileUpperAmplitudeScale(upperAmplitudeScale);
             saveAmplitudeScale();

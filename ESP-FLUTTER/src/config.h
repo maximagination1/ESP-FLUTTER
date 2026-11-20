@@ -216,7 +216,7 @@
 #define SERVO_SAFE_MAX_ANGLE 180
 
 // WiFi AP / ESP-NOW channel. The transmitter must use this same channel.
-#define WIFI_AP_CHANNEL 1
+#define WIFI_AP_CHANNEL 3
 
 // ELRS / CRSF receiver UART. Wire receiver TX to ELRS_RX_PIN and receiver RX
 // to ELRS_TX_PIN for the selected board profile above.
